@@ -1,0 +1,14 @@
+{
+  "name": "monoclo-jarvis-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "J.A.R.V.I.S: воронка «Monoclo · Свій принт» у KeyCRM без відкритої вкладки (Railway).",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node index.js",
+    "sync": "cp ../funnel.js ./funnel.js",
+    "check": "node --check index.js && node --check funnel.js"
+  }
+}
