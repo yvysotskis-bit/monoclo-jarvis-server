@@ -273,6 +273,18 @@ async function cycle() {
     const t = await F.funnelTick(true);
     status.moved = (t && t.moved) || 0;
     await notifyChanges(before);
+    // Діагностика таймера: чому картки, що чекають на клієнта, ще не в «Нагадуванні».
+    try {
+      const fl = store.funnelLog || [];
+      const stageAt = {};
+      for (const e of fl) if (e.id && e.at > (stageAt[e.id] || 0)) stageAt[e.id] = e.at;
+      const iso = (t) => (t ? new Date(t).toISOString().slice(5, 16) : '-');
+      const rows = Object.values(store.funnelCards || {}).filter((c) => c.inNew && ['price', 'sketch_sent', 'invoice'].includes(c.key)).map((c) => {
+        const st = (store.funnelState || {})[c.id] || {};
+        return `${c.id}:${c.key} mine=${iso(st.lastMineAt)} client=${iso(st.lastClientAt)} statusAt=${iso(c.statusAt)} stageAt=${iso(stageAt[c.id])} changed=${iso(c.changedAt)}`;
+      });
+      log('wait-cards ' + rows.length + '\n' + rows.join('\n'));
+    } catch (e) { log('diag', e.message); }
     status.lastOkAt = Date.now();
     status.lastError = '';
     log(`cycle ok: cards ${list.length}, read ${read}, moved ${status.moved}` + (store.funnelTickErr ? ` · tick error ${store.funnelTickErr}` : '') + (store.funnelLastPutErr ? ` · put error ${store.funnelLastPutErr}` : ''));
