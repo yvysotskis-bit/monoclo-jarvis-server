@@ -751,7 +751,9 @@ async function funnelTick(force = false) {
       if (!card.inNew) continue;
       const st = funnelState[card.id] || {};
       if (WAIT_KEYS.includes(card.key)) {
-        const known = Math.max(st.lastMineAt || 0, card.statusAt || 0, stageAt[card.id] || 0);
+        // Чекаємо на клієнта від нашого останнього повідомлення. Час зміни етапу беремо, лише коли переписки не бачили:
+        // інакше перенесення карток між воронками скидало б відлік.
+        const known = st.lastMineAt || Math.max(card.statusAt || 0, stageAt[card.id] || 0);
         const last = known || card.changedAt || 0;
         const clientAfter = (st.lastClientAt || 0) > last;
         if (!clientAfter && last && Date.now() - last > FDAY) {
