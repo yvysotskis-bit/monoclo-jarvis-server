@@ -261,6 +261,8 @@ async function setStage(card, key, { by = 'jarvis', communicateAt, note } = {}) 
   await funnelLog(Object.assign({ id: card.id, from, to: key, by }, STAGE[key] && STAGE[key].lost && st0.reason ? { reason: st0.reason } : {}));
   // Клієнт пішов далі (передоплата, ескіз, рахунок): заперечення відпрацьоване, причину знімаємо.
   if (st0.reason && STAGE[key] && !STAGE[key].lost && STAGE[key].rank >= STAGE.sketch.rank) await setFstate(card.id, { reason: null, reasonQuote: null });
+  // Тест нагадувань A/B: картка після нагадування дійшла до ескізу чи далі — варіант спрацював.
+  if (st0.abVar && !st0.abWon && STAGE[key] && !STAGE[key].lost && STAGE[key].rank >= STAGE.sketch.rank) await setFstate(card.id, { abWon: true, abWonAt: Date.now() });
   return next;
 }
 
@@ -760,7 +762,14 @@ async function funnelTick(force = false) {
           try {
             await setStage(card, 'remind', { by: 'timer', communicateAt: Date.now() });
             // Пропозицію закрити (клієнт прямо відмовився) не скидаємо.
-            await setFstate(card.id, { prev: card.key, nudges: 0, suggest: st.suggest && STAGE[st.suggest] && STAGE[st.suggest].lost ? st.suggest : null, remindAt: Date.now() });
+            const ab = {};
+            // Перше нагадування після ціни: по черзі варіант A або B, щоб порівняти, який частіше веде до передоплати.
+            if (card.key === 'price' && !st.abVar) {
+              const { abNext = 'A' } = await chrome.storage.local.get(['abNext']);
+              Object.assign(ab, { abVar: abNext, abAt: Date.now() });
+              await chrome.storage.local.set({ abNext: abNext === 'A' ? 'B' : 'A' });
+            }
+            await setFstate(card.id, Object.assign({ prev: card.key, nudges: 0, suggest: st.suggest && STAGE[st.suggest] && STAGE[st.suggest].lost ? st.suggest : null, remindAt: Date.now() }, ab));
             moved++;
           } catch (e) { await chrome.storage.local.set({ funnelTickErr: `${card.id}: ${e.message}` }); }
         }

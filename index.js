@@ -209,7 +209,8 @@ function normMsgs(d) {
     const text = typeof raw === 'string' ? raw.replace(/<[^>]+>/g, ' ').trim() : '';
     const files = [].concat(m.attachments || [], m.files || [], m.media || []);
     const img = /image|photo|picture/i.test(String(m.message_type || '')) || files.some((f) => /image|photo|jpe?g|png|webp/i.test(String((f && (f.type || f.mime_type || f.mime || f.url || f.file_url)) || f)));
-    return { mine: pickBool(m), text, img, at: kcTime(m.created_at || m.date || m.sent_at || m.timestamp) };
+    const sender = m.sender_id ?? m.user_id ?? (m.sender && m.sender.id) ?? null;
+    return { mine: pickBool(m), text, img, at: kcTime(m.created_at || m.date || m.sent_at || m.timestamp), sender: sender == null ? null : String(sender) };
   }).sort((a, b) => a.at - b.at);
 }
 
@@ -238,10 +239,10 @@ async function notifyChanges(before) {
     }
     // Щойно перейшла в «Нагадування».
     const prevCard = before.cards[id];
-    if (card.key === 'remind' && prevCard && prevCard.key !== 'remind') reminds.push(nm(card));
+    if (card.key === 'remind' && prevCard && prevCard.key !== 'remind') reminds.push(card);
   }
   if (reminds.length) {
-    try { await tgSend(`⏰ <b>Нагадати сьогодні</b> (мовчать понад добу після нашої відповіді):\n${esc(reminds.join(', '))}`, null, true); } catch (e) { log('tg', e.message); }
+    try { await tgSend(reminderDigest(reminds), null, true); } catch (e) { log('tg', e.message); }
   }
 }
 
@@ -259,7 +260,7 @@ async function cycle() {
     for (const c of list) {
       try {
         const msgs = normMsgs(await internalGet(`/conversations/messages/by_lead/${c.id}`));
-        if (msgs.length) { await F.onHistory({ cardId: c.id, messages: msgs }); read++; }
+        if (msgs.length) { await F.onHistory({ cardId: c.id, messages: msgs }); recordResponses(c.id, msgs); read++; }
       } catch (e) {
         if (/Вхід|токен|KEYCRM_USER/.test(e.message)) throw e;   // без входу далі немає сенсу
         log('history', c.id, e.message);
@@ -296,6 +297,197 @@ async function cycle() {
       try { await tgSend(`⚠️ J.A.R.V.I.S (сервер воронки): ${e.message}`); } catch (_) { /* ignore */ }
     }
   } finally { cycling = false; }
+}
+
+
+// ---------- Робочий час (10:00–20:00 Київ) ----------
+const WORK_FROM = 10, WORK_TO = 20;
+function kyivParts(ts) {
+  const f = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, weekday: 'short' });
+  const o = {}; for (const p of f.formatToParts(new Date(ts))) o[p.type] = p.value;
+  const wd = new Date(ts).toLocaleDateString('en-US', { timeZone: 'Europe/Kyiv', weekday: 'short' });
+  return { day: `${o.year}-${o.month}-${o.day}`, h: Number(o.hour) % 24, m: Number(o.minute), wd };
+}
+// Коли відлік відповіді реально почався: повідомлення вночі рахуємо з 10:00.
+function workStart(ts) {
+  const k = kyivParts(ts);
+  if (k.h >= WORK_FROM && k.h < WORK_TO) return ts;
+  const minsToTen = ((WORK_FROM - k.h + 24) % 24) * 60 - k.m;
+  return ts + minsToTen * 60000;
+}
+const isWorkNow = () => { const k = kyivParts(Date.now()); return k.h >= WORK_FROM && k.h < WORK_TO; };
+
+// ---------- Імена менеджерів ----------
+let usersMap = null, usersAt = 0;
+async function managerName(id) {
+  if (!id) return 'бот / без автора';
+  if (!usersMap || Date.now() - usersAt > 12 * 3600 * 1000) {
+    usersMap = {}; usersAt = Date.now();
+    try {
+      const d = await internalGet('/users?limit=200');
+      const arr = Array.isArray(d) ? d : (d && (d.data || (d.data && d.data.data))) || [];
+      for (const u of arr) usersMap[String(u.id)] = (u.full_name || [u.first_name, u.last_name].filter(Boolean).join(' ') || u.name || u.email || '').trim();
+    } catch (e) { log('users', e.message); }
+  }
+  return usersMap[String(id)] || `менеджер #${id}`;
+}
+
+// ---------- Швидкість відповіді ----------
+// Для кожної «першої репліки клієнта» після нашої відповіді — скільки хвилин до наступної відповіді менеджера.
+function recordResponses(cardId, msgs) {
+  const log2 = store.respLog || (store.respLog = {});
+  let waitFrom = null;
+  for (const m of msgs) {
+    if (m.mine === false) { if (waitFrom == null) waitFrom = m.at; continue; }
+    if (m.mine === true && waitFrom != null) {
+      if (m.sender) {   // відповіді бота не рахуємо
+        const key = `${cardId}:${waitFrom}`;
+        if (!log2[key]) log2[key] = { at: waitFrom, mins: Math.max(0, Math.round((m.at - workStart(waitFrom)) / 60000)), sender: m.sender };
+      }
+      waitFrom = null;
+    }
+  }
+  const cut = Date.now() - 60 * 86400000;
+  for (const [k, v] of Object.entries(log2)) if (v.at < cut) delete log2[k];
+  persist();
+}
+
+const SPEED_LIMIT_MIN = Math.max(5, Number(ENV.SPEED_ALERT_MINUTES) || 15);
+let fastBusy = false;
+async function fastCheck() {
+  if (fastBusy || cycling || !isWorkNow()) return;
+  fastBusy = true;
+  try {
+    const cards = await F.syncFunnel(false);
+    const st = store.funnelState || {};
+    const alerted = store.speedAlerted || (store.speedAlerted = {});
+    for (const c of Object.values(cards)) {
+      const s0 = st[c.id] || {};
+      const fresh = c.createdAt && Date.now() - c.createdAt < 3 * 3600000 && !s0.lastMineAt;
+      const waiting = (s0.lastClientAt || 0) > (s0.lastMineAt || 0);
+      if (!fresh && !waiting) continue;
+      let msgs = [];
+      try { msgs = normMsgs(await internalGet(`/conversations/messages/by_lead/${c.id}`)); } catch (e) { continue; }
+      if (!msgs.length) continue;
+      await F.onHistory({ cardId: c.id, messages: msgs });
+      recordResponses(c.id, msgs);
+      const last = msgs[msgs.length - 1];
+      if (last.mine !== false) continue;
+      // Перша репліка клієнта в поточному «очікуванні».
+      let i = msgs.length - 1; while (i > 0 && msgs[i - 1].mine === false) i--;
+      const first = msgs[i];
+      if (Date.now() - first.at > 48 * 3600000) continue;          // давні — не сповіщаємо
+      const waited = Math.round((Date.now() - workStart(first.at)) / 60000);
+      if (waited < SPEED_LIMIT_MIN || alerted[c.id] === first.at) continue;
+      alerted[c.id] = first.at; persist();
+      const quote = (last.text || (last.img ? '[фото]' : '')).replace(/\s+/g, ' ').slice(0, 120);
+      try { await tgSend(`⏱ <b>${esc(nm(c))}</b> чекає відповіді ${waited} хв${quote ? `:\n«${esc(quote)}»` : ''}`, null, true); } catch (e) { log('tg', e.message); }
+      await sleep(300);
+    }
+  } catch (e) { log('fast', e.message); } finally { fastBusy = false; }
+}
+
+// ---------- Тексти нагадувань A/B ----------
+function itemOf(card) {
+  const names = (card.products || []).map((p) => String(p.name || '').toLowerCase()).join(' ');
+  // «Індивідуальний Принт Monoclo» один товар на худі й футболку: розрізняємо за ціною.
+  const prices = (card.products || []).map((p) => Number(p.price) || 0);
+  if (/футболк/.test(names) || prices.some((x) => x === 1450 || x === 999)) return { acc: 'вашу футболку', inst: 'футболкою', total: 1450 };
+  if (/постер/.test(names)) return { acc: 'ваш постер', inst: 'постером', total: 0 };
+  return { acc: 'ваше худі', inst: 'худі', total: 2450 };
+}
+function abText(variant, card) {
+  const it = itemOf(card);
+  const total = card.total || it.total;
+  if (variant === 'B') {
+    const part = total ? `Оплатити можна частинами monobank, наприклад ${Math.round(total / 10)} грн на місяць, 10 платежів без переплати. ` : '';
+    return `Добрий день! Ще думаєте над ${it.inst} зі своїм принтом? ${part}А ось відгуки тих, хто вже замовив свій принт: https://monoclo.com.ua/pages/reviews. Запустимо ескіз?`;
+  }
+  return `Добрий день! Нагадаю про ${it.acc} 🖤 Дизайнер може взятися за ескіз уже сьогодні: передоплата 200 грн, і якщо ескіз не сподобається, я поверну її. Починаємо?`;
+}
+
+// Картки, що вже стоять у «Нагадуванні» після ціни без тесту: роздаємо варіанти по черзі.
+async function abBackfill() {
+  const st = store.funnelState || {};
+  let next = store.abNext || 'A';
+  let n = 0;
+  for (const c of Object.values(store.funnelCards || {})) {
+    const s0 = st[c.id];
+    if (!c.inNew || c.key !== 'remind' || !s0 || s0.prev !== 'price' || s0.abVar || (s0.nudges || 0) > 0) continue;
+    await F.setFstate(c.id, { abVar: next, abAt: Date.now() });
+    next = next === 'A' ? 'B' : 'A'; n++;
+  }
+  store.abNext = next; persist();
+  return n;
+}
+
+function reminderDigest(cards) {
+  const st = store.funnelState || {};
+  const blocks = cards.map((c) => {
+    const v = (st[c.id] || {}).abVar;
+    return v ? `<b>${esc(nm(c))}</b> · варіант ${v}\n<code>${esc(abText(v, c))}</code>` : `<b>${esc(nm(c))}</b>`;
+  });
+  return `⏰ <b>Нагадати сьогодні</b> (мовчать понад добу після нашої відповіді). Текст натисни, щоб скопіювати:\n\n${blocks.join('\n\n')}`;
+}
+
+// ---------- Тижневий звіт ----------
+function median(a) { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); const m = Math.floor(s.length / 2); return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2); }
+async function weeklyReport() {
+  const WEEK = 7 * 86400000, since = Date.now() - WEEK;
+  const cards = Object.values(store.funnelCards || {});
+  const closed = ((store.funnelClosed || {}).cards || []);
+  const all = [...cards, ...closed.filter((x) => !cards.some((c) => c.id === x.id))];
+  const st = store.funnelState || {};
+  const lines = ['📊 <b>Тиждень у воронці «Свій принт»</b>'];
+  const fresh = all.filter((c) => c.createdAt >= since);
+  lines.push(`Нових звернень: <b>${fresh.length}</b>`);
+  // Переходи за тиждень.
+  const logw = (store.funnelLog || []).filter((e) => e.at >= since);
+  const reached = (k) => new Set(logw.filter((e) => e.to === k).map((e) => e.id)).size;
+  lines.push(`Дійшли до ціни: ${reached('price')} · до ескізу: ${reached('sketch')} · до рахунку: ${reached('invoice')} · оплачено: ${reached('paid')}`);
+  const lost = {}; for (const e of logw) if (F.STAGE[e.to] && F.STAGE[e.to].lost) lost[e.to] = (lost[e.to] || 0) + 1;
+  if (Object.keys(lost).length) lines.push('Втрачено: ' + Object.entries(lost).map(([k, n]) => `${F.STAGE[k].label} ${n}`).join(' · '));
+  // Причини з чатів.
+  const rs = {}; const quotes = [];
+  for (const s0 of Object.values(st)) if (s0 && s0.reason && (s0.reasonAt || 0) >= since) { rs[s0.reason] = (rs[s0.reason] || 0) + 1; if (s0.reasonQuote && quotes.length < 4) quotes.push(s0.reasonQuote.slice(0, 60)); }
+  if (Object.keys(rs).length) lines.push('Причини: ' + Object.entries(rs).map(([k, n]) => `${F.REASON_LABEL[k] || k} ${n}`).join(' · ') + (quotes.length ? `\n<i>${quotes.map((q) => `«${esc(q)}»`).join(' ')}</i>` : ''));
+  // Гроші в роботі.
+  const open = cards.filter((c) => c.inNew && F.OPEN_KEYS.includes(c.key));
+  const sum = (l) => Math.round(l.reduce((a, c) => a + (c.total || 0), 0)).toLocaleString('uk-UA');
+  const hot = open.filter((c) => ['sketch', 'sketch_sent', 'invoice'].includes(c.key));
+  lines.push(`Карток у роботі: ${open.length} · сума в них ${sum(open)} грн · гарячі ${hot.length} (${sum(hot)} грн)`);
+  // Завислі.
+  const stuck = open.filter((c) => { const s0 = st[c.id] || {}; return (c.key === 'remind' && (s0.nudges || 0) >= 3) || (['sketch', 'sketch_sent', 'invoice'].includes(c.key) && Date.now() - (s0.lastMineAt || c.changedAt || 0) > 3 * 86400000); });
+  if (stuck.length) lines.push(`Завислі: ${esc(shortList(stuck.map(nm), 8))}`);
+  // Швидкість відповіді.
+  const resp = Object.values(store.respLog || {}).filter((r) => r.at >= since);
+  if (resp.length) {
+    const by = {};
+    for (const r of resp) (by[r.sender] = by[r.sender] || []).push(r.mins);
+    const rows = [];
+    for (const [id, arr] of Object.entries(by).sort((a, b) => b[1].length - a[1].length)) {
+      const within = Math.round(100 * arr.filter((x) => x <= SPEED_LIMIT_MIN).length / arr.length);
+      rows.push(`${esc(await managerName(id))}: медіана ${median(arr)} хв, до ${SPEED_LIMIT_MIN} хв ${within}% (${arr.length})`);
+    }
+    lines.push('⏱ Перша відповідь (робочий час):\n' + rows.join('\n'));
+  }
+  // A/B нагадувань.
+  const ab = { A: [0, 0], B: [0, 0] };
+  for (const s0 of Object.values(st)) if (s0 && s0.abVar && ab[s0.abVar]) { ab[s0.abVar][0]++; if (s0.abWon) ab[s0.abVar][1]++; }
+  if (ab.A[0] + ab.B[0]) {
+    const pct = (x) => (x[0] ? Math.round(100 * x[1] / x[0]) : 0);
+    lines.push(`🧪 Нагадування після ціни: A «ескіз сьогодні» ${ab.A[1]}/${ab.A[0]} (${pct(ab.A)}%) · B «частини + відгуки» ${ab.B[1]}/${ab.B[0]} (${pct(ab.B)}%)` + (ab.A[0] >= 15 && ab.B[0] >= 15 ? `\nПереможець поки: ${pct(ab.A) >= pct(ab.B) ? 'A' : 'B'}` : '\nДля висновку треба хоча б по 15 карток на варіант.'));
+  }
+  return lines.join('\n\n');
+}
+async function maybeWeekly() {
+  const k = kyivParts(Date.now());
+  const want = (ENV.WEEKLY_TIME || '10:00').trim();
+  const hm = `${String(k.h).padStart(2, '0')}:${String(k.m).padStart(2, '0')}`;
+  if (k.wd !== 'Mon') return;
+  if (store.weeklyDay === k.day || hm < want) return;
+  store.weeklyDay = k.day; persist();
+  try { await tgSend(await weeklyReport(), null, true); } catch (e) { log('weekly', e.message); }
 }
 
 // ---------- Ранковий звіт воронки ----------
@@ -372,6 +564,14 @@ http.createServer((req, res) => {
   if (!TG || !TG_CHAT) log('УВАГА: Telegram не налаштовано, сповіщень не буде');
   pollTelegram();
   await cycle();
+  if (!store.abBackfillDone) {
+    const n = await abBackfill().catch(() => 0);
+    store.abBackfillDone = true; persist();
+    const list = Object.values(store.funnelCards || {}).filter((c) => c.inNew && c.key === 'remind' && ((store.funnelState || {})[c.id] || {}).abVar && !((store.funnelState || {})[c.id] || {}).nudges);
+    if (n && list.length) { try { await tgSend(reminderDigest(list), null, true); } catch (e) { log('tg', e.message); } }
+  }
   setInterval(cycle, CYCLE_MIN * 60000);
+  setInterval(fastCheck, 3 * 60000);
   setInterval(maybeBrief, 60000);
+  setInterval(maybeWeekly, 60000);
 })();
