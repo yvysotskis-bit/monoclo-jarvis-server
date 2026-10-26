@@ -40,6 +40,10 @@ const nameKey = (t) => String(t || '').toLowerCase().replace(/^чат з\s+/i, '
 function kcStamp(ts) {
   return new Date(ts).toISOString().slice(0, 19).replace('T', ' ');
 }
+// Час для полів, які KeyCRM читає як київський (наступний контакт): інакше UTC виходить «у минулому».
+function kcLocalStamp(ts) {
+  return new Date(ts).toLocaleString('sv-SE', { timeZone: 'Europe/Kyiv', hour12: false }).slice(0, 19);
+}
 
 async function funnelCfg() {
   const s = await chrome.storage.local.get(['funnelOn', 'funnelName', 'shopSources']);
@@ -237,11 +241,19 @@ async function setStage(card, key, { by = 'jarvis', communicateAt, note } = {}) 
   const sid = meta.ids[key];
   if (!sid) throw new Error(`У воронці немає статусу «${STAGE[key] ? STAGE[key].label : key}».`);
   const body = { status_id: sid };
-  if (communicateAt) body.communicate_at = kcStamp(communicateAt);
+  if (communicateAt) body.communicate_at = kcLocalStamp(Math.max(communicateAt, Date.now() + 10 * 60000));
   if (note) body.note = note;
   const hot = HOT_KEYS.includes(key);
   if (hot && card.title && !card.title.startsWith(HOT_MARK)) body.title = HOT_MARK + card.title;
-  await keycrm(`/pipelines/cards/${card.id}`, { method: 'PUT', body });
+  try {
+    await keycrm(`/pipelines/cards/${card.id}`, { method: 'PUT', body });
+  } catch (e) {
+    // Час контакту не критичний: якщо KeyCRM його не приймає, міняємо лише етап.
+    if (!body.communicate_at) throw e;
+    delete body.communicate_at;
+    await keycrm(`/pipelines/cards/${card.id}`, { method: 'PUT', body });
+    await chrome.storage.local.set({ funnelLastPutErr: `${card.id}: ${e.message}` });
+  }
   const from = card.inNew ? card.key : `old:${card.key || ''}`;
   const next = Object.assign({}, card, { key, statusId: sid, inNew: true, changedAt: Date.now(), title: body.title || card.title });
   await saveCardCache(next);
@@ -509,7 +521,7 @@ async function onMineSent({ name, text, transcript }) {
       const n = (st.nudges || 0) + 1;
       patch.nudges = n; patch.lastNudgeAt = Date.now();
       if (n < 3) {
-        try { await keycrm(`/pipelines/cards/${card.id}`, { method: 'PUT', body: { communicate_at: kcStamp(nextNudgeAt(n)) } }); } catch (_) { /* не критично */ }
+        try { await keycrm(`/pipelines/cards/${card.id}`, { method: 'PUT', body: { communicate_at: kcLocalStamp(nextNudgeAt(n)) } }); } catch (_) { /* не критично */ }
       }
     }
   } else if (card.key && STAGE[card.key].rank >= 0) {
@@ -748,7 +760,7 @@ async function funnelTick(force = false) {
             // Пропозицію закрити (клієнт прямо відмовився) не скидаємо.
             await setFstate(card.id, { prev: card.key, nudges: 0, suggest: st.suggest && STAGE[st.suggest] && STAGE[st.suggest].lost ? st.suggest : null, remindAt: Date.now() });
             moved++;
-          } catch (_) { /* наступного разу */ }
+          } catch (e) { await chrome.storage.local.set({ funnelTickErr: `${card.id}: ${e.message}` }); }
         }
       } else if (card.key === 'remind') {
         if ((st.nudges || 0) >= 3 && Date.now() - (st.lastNudgeAt || 0) > LOSS_AFTER_LAST && !st.suggest) {

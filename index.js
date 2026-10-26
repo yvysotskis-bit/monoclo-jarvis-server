@@ -269,12 +269,13 @@ async function cycle() {
     status.read = read;
     before.cards = clone(store.funnelCards || {});   // етапи після читання історії: так видно, кого перевів саме таймер
     store.funnelTickAt = 0;
+    store.funnelTickErr = null; store.funnelLastPutErr = null;
     const t = await F.funnelTick(true);
     status.moved = (t && t.moved) || 0;
     await notifyChanges(before);
     status.lastOkAt = Date.now();
     status.lastError = '';
-    log(`cycle ok: cards ${list.length}, read ${read}, moved ${status.moved}`);
+    log(`cycle ok: cards ${list.length}, read ${read}, moved ${status.moved}` + (store.funnelTickErr ? ` · tick error ${store.funnelTickErr}` : '') + (store.funnelLastPutErr ? ` · put error ${store.funnelLastPutErr}` : ''));
   } catch (e) {
     status.lastError = e.message;
     log('cycle error:', e.message);
@@ -345,7 +346,8 @@ http.createServer((req, res) => {
     lastCycleAt: status.lastCycleAt ? new Date(status.lastCycleAt).toISOString() : null,
     lastOkAt: status.lastOkAt ? new Date(status.lastOkAt).toISOString() : null,
     lastError: status.lastError || null,
-    cards: status.cards, historyRead: status.read, movedToRemind: status.moved, cycleMinutes: CYCLE_MIN
+    cards: status.cards, historyRead: status.read, movedToRemind: status.moved, cycleMinutes: CYCLE_MIN,
+    tickError: store.funnelTickErr || null, putError: store.funnelLastPutErr || null
   };
   res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body, null, 2));
