@@ -153,6 +153,65 @@ const funnelSrc = fs.readFileSync(path.join(__dirname, 'funnel.js'), 'utf8') + `
 vm.runInThisContext(funnelSrc, { filename: 'funnel.js' });
 const F = globalThis.__F;
 
+// ---------- Обіцянки клієнтам (спільний promises.js з розширення) ----------
+const PR = require('./promises.js');
+const PROMISE_TIME = (ENV.PROMISE_TIME || '18:00').trim();
+
+// Нові обіцянки менеджерів у переписці картки + автоматичне закриття, коли менеджер згодом відповів.
+async function trackPromises(card, msgs) {
+  const all = store.promises || (store.promises = {});
+  const ignored = store.promisesIgnored || (store.promisesIgnored = {});
+  const since = Date.now() - 7 * 86400000;
+  for (const m of msgs) {
+    if (m.mine !== true || !m.sender || m.at < since || !m.text) continue;   // бот (без автора) не обіцяє
+    const key = `${card.id}:${m.at}`;
+    if (all[key] || ignored[key]) continue;
+    const p = PR.detectPromise(m.text, m.at);
+    if (!p) continue;
+    all[key] = { key, cardId: card.id, name: nm(card), sender: m.sender, quote: p.quote, at: p.at, due: p.due, done: false };
+  }
+  const mine = Object.values(all).filter((p) => p.cardId === card.id);
+  PR.resolvePromises(mine, msgs, (m) => m.mine === true && !!m.sender);
+  const cut = Date.now() - 14 * 86400000;
+  for (const [k, p] of Object.entries(all)) if (p.at < cut) delete all[k];
+  for (const [k, t] of Object.entries(ignored)) if (t < cut) delete ignored[k];
+  persist();
+}
+
+async function promiseLine(p) {
+  const who = await managerName(p.sender);
+  const late = p.due < PR.kyivDay(Date.now()) ? ` · <b>прострочено з ${PR.fmtDay(p.due)}</b>` : '';
+  return `<b>${esc(p.name)}</b> · ${PR.fmtDay(PR.kyivDay(p.at))}, ${esc(who)}${late}\n«${esc(p.quote)}»`;
+}
+
+// Ранковий блок: що пообіцяли зробити сьогодні (і що вже прострочено).
+async function promisesBrief() {
+  const due = PR.duePromises(Object.values(store.promises || {})).slice(0, 10);
+  if (!due.length) return '';
+  const lines = [];
+  for (const p of due) lines.push(await promiseLine(p));
+  return `🤝 <b>Обіцяно клієнтам на сьогодні: ${due.length}</b>\n\n${lines.join('\n\n')}`;
+}
+
+// Вечірнє нагадування: обіцянки на сьогодні, на які ще ніхто не відповів. Кнопки: виконано / на завтра.
+async function maybePromiseAlert() {
+  const k = kyivParts(Date.now());
+  const hm = `${String(k.h).padStart(2, '0')}:${String(k.m).padStart(2, '0')}`;
+  if (store.promiseAlertDay === k.day || hm < PROMISE_TIME) return;
+  store.promiseAlertDay = k.day; persist();
+  const due = PR.duePromises(Object.values(store.promises || {})).slice(0, 8);
+  if (!due.length) return;
+  const lines = [];
+  for (const p of due) lines.push(await promiseLine(p));
+  const kb = due.map((p) => [
+    { text: `✅ ${p.name}`.slice(0, 40), callback_data: `pd:${p.key}` },
+    { text: '⏭ На завтра', callback_data: `pz:${p.key}` }
+  ]);
+  try {
+    await tgSend(`🤝 <b>Обіцянки без відповіді клієнту</b> (термін сьогодні або раніше)\n\n${lines.join('\n\n')}`, null, true, { reply_markup: { inline_keyboard: kb } });
+  } catch (e) { log('tg promises', e.message); }
+}
+
 // ---------- Внутрішній API KeyCRM (переписка) від імені технічного користувача ----------
 const auth = { access: store.kcAccess || '', refresh: store.kcRefresh || '' };
 function saveTokens(d) {
@@ -260,7 +319,12 @@ async function cycle() {
     for (const c of list) {
       try {
         const msgs = normMsgs(await internalGet(`/conversations/messages/by_lead/${c.id}`));
-        if (msgs.length) { await F.onHistory({ cardId: c.id, messages: msgs }); recordResponses(c.id, msgs); read++; }
+        if (msgs.length) {
+          await F.onHistory({ cardId: c.id, messages: msgs });
+          recordResponses(c.id, msgs);
+          try { await trackPromises(c, msgs); } catch (e) { log('promises', c.id, e.message); }
+          read++;
+        }
       } catch (e) {
         if (/Вхід|токен|KEYCRM_USER/.test(e.message)) throw e;   // без входу далі немає сенсу
         log('history', c.id, e.message);
@@ -371,6 +435,7 @@ async function fastCheck() {
       if (!msgs.length) continue;
       await F.onHistory({ cardId: c.id, messages: msgs });
       recordResponses(c.id, msgs);
+      try { await trackPromises(c, msgs); } catch (e) { log('promises', c.id, e.message); }
       const last = msgs[msgs.length - 1];
       if (last.mine !== false) continue;
       // Перша репліка клієнта в поточному «очікуванні».
@@ -504,7 +569,9 @@ async function maybeBrief() {
   try {
     const text = await globalThis.buildBriefing();
     const stats = await F.funnelStatsText().catch(() => '');
-    await tgSend(`${text.trim()}${stats ? `\n\n<i>${esc(stats)}</i>` : ''}`, null, true);
+    const prom = await promisesBrief().catch(() => '');
+    const body = [text.trim(), prom].filter(Boolean).join('\n\n');
+    await tgSend(`${body}${stats ? `\n\n<i>${esc(stats)}</i>` : ''}`, null, true);
   } catch (e) { log('brief', e.message); }
 }
 
@@ -523,7 +590,13 @@ async function pollTelegram() {
         const [act, cardId, key] = String(q.data || '').split(':');
         let note = '';
         try {
-          if (act === 's') {
+          if (act === 'pd' || act === 'pz') {
+            const p = (store.promises || {})[`${cardId}:${key}`];
+            if (!p) note = 'Обіцянку вже прибрано';
+            else if (act === 'pd') { p.done = 'manual'; p.doneAt = Date.now(); note = `Виконано: ${p.name}`; }
+            else { p.due = PR.addDays(PR.kyivDay(Date.now()), 1); note = `Перенесено на ${PR.fmtDay(p.due)}: ${p.name}`; }
+            persist();
+          } else if (act === 's') {
             const r = await F.setStageManual({ cardId: Number(cardId), key });
             note = `Готово: «${F.STAGE[key].label}»`;
             log('tg set', cardId, key, r && r.card && r.card.key);
@@ -551,7 +624,8 @@ http.createServer((req, res) => {
     lastOkAt: status.lastOkAt ? new Date(status.lastOkAt).toISOString() : null,
     lastError: status.lastError || null,
     cards: status.cards, historyRead: status.read, movedToRemind: status.moved, cycleMinutes: CYCLE_MIN,
-    tickError: store.funnelTickErr || null, putError: store.funnelLastPutErr || null
+    tickError: store.funnelTickErr || null, putError: store.funnelLastPutErr || null,
+    promisesOpen: Object.values(store.promises || {}).filter((p) => !p.done).length
   };
   res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body, null, 2));
@@ -574,4 +648,5 @@ http.createServer((req, res) => {
   setInterval(fastCheck, 3 * 60000);
   setInterval(maybeBrief, 60000);
   setInterval(maybeWeekly, 60000);
+  setInterval(maybePromiseAlert, 60000);
 })();
