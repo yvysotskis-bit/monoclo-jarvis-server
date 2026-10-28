@@ -8,7 +8,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node index.js",
-    "sync": "cp ../funnel.js ./funnel.js",
-    "check": "node --check index.js && node --check funnel.js"
+    "sync": "cp ../funnel.js ./funnel.js && cp ../promises.js ./promises.js",
+    "check": "node --check index.js && node --check funnel.js && node --check promises.js"
   }
 }
