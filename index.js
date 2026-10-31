@@ -273,6 +273,9 @@ function normMsgs(d) {
   }).sort((a, b) => a.at - b.at);
 }
 
+// ---------- Картки для клієнтів, що пишуть знову ----------
+const NC = require('./newcards')({ store, persist, internalGet, keycrm, normMsgs, kcTime, F, tgSend, esc, log });
+
 // ---------- Цикл ----------
 const status = { startedAt: Date.now(), lastCycleAt: 0, lastOkAt: 0, lastError: '', cards: 0, read: 0, moved: 0 };
 
@@ -312,7 +315,10 @@ async function cycle() {
   status.lastCycleAt = Date.now();
   try {
     const before = { state: clone(store.funnelState || {}), cards: clone(store.funnelCards || {}) };
-    const cards = await F.syncFunnel(true);
+    let cards = await F.syncFunnel(true);
+    // Спершу заводимо картки тим, хто написав знову без відкритої картки, потім перечитуємо воронку.
+    const nc = await NC.run();
+    if (nc.created.length) cards = await F.syncFunnel(false);
     const list = Object.values(cards);
     status.cards = list.length;
     let read = 0;
@@ -625,7 +631,8 @@ http.createServer((req, res) => {
     lastError: status.lastError || null,
     cards: status.cards, historyRead: status.read, movedToRemind: status.moved, cycleMinutes: CYCLE_MIN,
     tickError: store.funnelTickErr || null, putError: store.funnelLastPutErr || null,
-    promisesOpen: Object.values(store.promises || {}).filter((p) => !p.done).length
+    promisesOpen: Object.values(store.promises || {}).filter((p) => !p.done).length,
+    autoCards: NC.status
   };
   res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body, null, 2));
