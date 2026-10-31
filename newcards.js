@@ -77,8 +77,8 @@ module.exports = function makeNewCards(ctx) {
       let made = 0;
       for (const raw of rows) {
         const c = convFields(raw);
-        if (!c.clientId) { skip('без client_id'); continue; }
         if (!c.channelId || !channels.has(c.channelId)) { skip('не Monoclo'); continue; }
+        if (!c.clientId) { skip('без client_id'); if (!status.probeContact && raw.contact) status.probeContact = Object.keys(raw.contact).slice(0, 40); continue; }
         if (c.at && c.at < since) { skip('давно'); continue; }
         if (store.autoCardsDone[c.clientId]) { skip('вже створено'); continue; }
         if (hasOpenCard(c.clientId, c.name)) { skip('є картка'); continue; }
@@ -111,7 +111,7 @@ module.exports = function makeNewCards(ctx) {
       status.error = e.message;
       log('auto-cards error:', e.message);
     }
-    log('auto-cards ' + JSON.stringify({ created: status.created, skipped: status.skipped, error: status.error, probe: status.probe, channels: status.channels }));
+    log('auto-cards ' + JSON.stringify({ created: status.created, skipped: status.skipped, error: status.error, probe: status.probe, probeContact: status.probeContact, channels: status.channels }));
     return status;
   }
 
